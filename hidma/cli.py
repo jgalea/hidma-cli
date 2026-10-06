@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta
 
 from . import __version__
 from . import api as api_mod
+from . import report as report_mod
 from . import session as session_mod
 from .client import HidmaError, SessionExpired
 from .duration import format_minutes, parse_minutes
@@ -15,6 +16,9 @@ from .match import MatchError, match_one
 EXIT_API = 1
 EXIT_USAGE = 2
 EXIT_SESSION = 4
+
+ENTRY_COLUMNS = [("date", "DATE"), ("client", "CLIENT"), ("project", "PROJECT"), ("job", "JOB"), ("duration", "TIME"),
+                 ("nb", "NOT BILLABLE"), ("comments", "COMMENT"), ("id", "ID")]
 
 
 def _emit(rows: list[dict], columns: list[tuple[str, str]], as_json: bool) -> None:
@@ -47,8 +51,21 @@ def _parse_date(text: str | None) -> date:
         raise argparse.ArgumentTypeError(f"date must be YYYY-MM-DD, got {text!r}")
 
 
+def _parse_month(text: str) -> tuple[date, date]:
+    try:
+        first = datetime.strptime(text, "%Y-%m").date()
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"month must be YYYY-MM, got {text!r}")
+    nxt = (first.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return first, nxt - timedelta(days=1)
+
+
 def _public(entry: dict) -> dict:
     return {k: v for k, v in entry.items() if k != "cell"}
+
+
+def _label(entry: dict) -> str:
+    return " / ".join(x for x in (entry["client"], entry["project"], entry["job"]) if x)
 
 
 # -- commands -------------------------------------------------------------
@@ -65,7 +82,7 @@ def cmd_whoami(args) -> int:
     me = h.me()
     info = {
         "user_id": h.user_id, "tenant_id": h.client.tenant_id,
-        "name": " ".join(x for x in (me.get("firstName"), me.get("lastName")) if x) or me.get("name"),
+        "name": " ".join(x for x in (me.get("name"), me.get("surname")) if x),
         "email": me.get("email"),
     }
     info.update(session_mod.describe(h.client.data))
@@ -83,15 +100,13 @@ def cmd_clients(args) -> int:
     return 0
 
 
+def _name_of(value) -> str:
+    return value.get("name", "") if isinstance(value, dict) else ("" if value is None else str(value))
+
+
 def _project_rows(projects: list[dict]) -> list[dict]:
-    out = []
-    for p in projects:
-        client = p.get("client") if isinstance(p.get("client"), dict) else {}
-        state = p.get("state") if isinstance(p.get("state"), dict) else {}
-        out.append({"id": p.get("id"), "code": p.get("code", ""), "name": p.get("name", ""),
-                    "client": client.get("name", ""), "state": state.get("name", p.get("state", "")),
-                    "type": (p.get("type") or {}).get("name", "") if isinstance(p.get("type"), dict) else p.get("type", "")})
-    return out
+    return [{"id": p.get("id"), "code": p.get("code", ""), "name": p.get("name", ""), "client": _name_of(p.get("client")),
+             "state": _name_of(p.get("state") or p.get("status")), "type": _name_of(p.get("type"))} for p in projects]
 
 
 def cmd_projects(args) -> int:
@@ -105,10 +120,9 @@ def cmd_projects(args) -> int:
 
 
 def cmd_jobs(args) -> int:
-    rows = api_mod.Hidma().jobs(args.filter)
-    out = [{"id": j.get("id"), "name": j.get("name", ""),
-            "type": (j.get("type") or {}).get("name", "") if isinstance(j.get("type"), dict) else j.get("type", ""),
-            "active": j.get("active", "")} for j in rows]
+    h = api_mod.Hidma()
+    out = [{"id": j.get("id"), "name": j.get("name", ""), "type": h.job_shortcode(j), "active": j.get("active", "")}
+           for j in h.jobs(args.filter)]
     _emit(out, [("id", "ID"), ("name", "NAME"), ("type", "TYPE"), ("active", "ACTIVE")], args.json)
     return 0
 
@@ -122,23 +136,16 @@ def _resolve_target(h: api_mod.Hidma, project_query: str | None, job_query: str 
     if job_query:
         job = match_one(jobs, job_query, "job")
     else:
-        business = [j for j in jobs if _job_shortcode(j) == "b" and j.get("active", True)]
+        business = [j for j in jobs if h.job_shortcode(j) == "b" and j.get("active", True)]
         if project is None:
             raise MatchError("give --project (business time) or --job (internal/personal time)")
         if len(business) != 1:
             names = ", ".join(j.get("name", "") for j in business) or "none"
             raise MatchError(f"pick a job with --job; business jobs: {names}")
         job = business[0]
-    if _job_shortcode(job) == "b" and project is None:
+    if h.job_shortcode(job) == "b" and project is None:
         raise MatchError(f"job {job.get('name')!r} needs a project; add --project")
     return project, job
-
-
-def _job_shortcode(job: dict) -> str:
-    t = job.get("type")
-    if isinstance(t, dict):
-        return str(t.get("shortcode", "")).lower()
-    return ""
 
 
 def cmd_log(args) -> int:
@@ -150,9 +157,8 @@ def cmd_log(args) -> int:
     if args.json:
         _emit_json(_public(result))
         return 0
-    label = " / ".join(x for x in (result["client"], result["project"], result["job"]) if x)
     verb = {"new-row": "logged", "new-cell": "logged", "merged": "merged into the day's existing entry, now"}[result["action"]]
-    print(f"{verb} {format_minutes(result['minutes'])} on {result['date']} for {label}")
+    print(f"{verb} {format_minutes(result['minutes'])} on {result['date']} for {_label(result)}")
     print(f"id: {result['id']}")
     if result["not_billable"]:
         print(f"not billable: {format_minutes(result['not_billable'])}")
@@ -164,11 +170,24 @@ def _range(args) -> tuple[date, date]:
         start = args.start or args.end
         end = args.end or args.start
         return start, end
+    if getattr(args, "month", None):
+        return args.month
     if args.week:
         start = api_mod.monday_of(args.week)
         return start, start + timedelta(days=6)
     start = api_mod.monday_of(date.today())
     return start, start + timedelta(days=6)
+
+
+def _print_entries(entries: list[dict], start: date, end: date) -> None:
+    t = api_mod.totals(entries)
+    rows = [dict(e, duration=format_minutes(e["minutes"]),
+                 nb=format_minutes(e["not_billable"]) if e["not_billable"] else "") for e in entries]
+    _emit(rows, ENTRY_COLUMNS, False)
+    if entries:
+        print("\nper day:     " + "  ".join(f"{d[5:]} {format_minutes(m)}" for d, m in t["by_day"].items()))
+        print("per project: " + "  ".join(f"{k} {format_minutes(m)}" for k, m in t["by_project"].items()))
+        print(f"total:       {format_minutes(t['total'])}  ({start} to {end})")
 
 
 def cmd_entries(args) -> int:
@@ -178,18 +197,87 @@ def cmd_entries(args) -> int:
     if args.project:
         q = args.project.lower()
         entries = [e for e in entries if q in e["project"].lower() or q in e["client"].lower() or q == str(e["project_id"])]
-    t = api_mod.totals(entries)
     if args.json:
-        _emit_json({"from": str(start), "to": str(end), "entries": [_public(e) for e in entries], "totals": t})
+        _emit_json({"from": str(start), "to": str(end), "entries": [_public(e) for e in entries], "totals": api_mod.totals(entries)})
+        return 0
+    _print_entries(entries, start, end)
+    return 0
+
+
+def cmd_today(args) -> int:
+    args.start = args.end = date.today()
+    args.week = args.project = None
+    return cmd_entries(args)
+
+
+def cmd_last(args) -> int:
+    entries = api_mod.Hidma().recent_entries(args.count)
+    if args.json:
+        _emit_json([_public(e) for e in entries])
         return 0
     rows = [dict(e, duration=format_minutes(e["minutes"]),
                  nb=format_minutes(e["not_billable"]) if e["not_billable"] else "") for e in entries]
-    _emit(rows, [("date", "DATE"), ("client", "CLIENT"), ("project", "PROJECT"), ("job", "JOB"),
-                 ("duration", "TIME"), ("nb", "NOT BILLABLE"), ("comments", "COMMENT"), ("id", "ID")], False)
-    if entries:
-        print("\nper day:     " + "  ".join(f"{d[5:]} {format_minutes(m)}" for d, m in t["by_day"].items()))
-        print("per project: " + "  ".join(f"{k} {format_minutes(m)}" for k, m in t["by_project"].items()))
-        print(f"total:       {format_minutes(t['total'])}  ({start} to {end})")
+    _emit(rows, ENTRY_COLUMNS, False)
+    return 0
+
+
+def cmd_week(args) -> int:
+    h = api_mod.Hidma()
+    monday = api_mod.monday_of(args.date)
+    ts = h.week_timesheet(monday)
+    entries = api_mod.flatten(ts) if ts else []
+    status = h.timesheet_state_name(ts) if ts else ""
+    if args.json:
+        _emit_json({"week": str(monday), "status": status, "entries": [_public(e) for e in entries], "totals": api_mod.totals(entries)})
+        return 0
+    print(report_mod.week_grid(entries, monday, status))
+    return 0
+
+
+def cmd_report(args) -> int:
+    h = api_mod.Hidma()
+    if args.unbilled:
+        return _unbilled_report(h, args)
+    start, end = _range(args)
+    rows = report_mod.aggregate(h.entries(start, end), args.by)
+    if args.json:
+        _emit_json({"from": str(start), "to": str(end), "by": args.by, "rows": rows})
+        return 0
+    if args.csv:
+        report_mod.write_csv(rows, ["key", "minutes", "billable", "not_billable", "entries"])
+        return 0
+    out = [dict(r, time=format_minutes(r["minutes"]), billable_time=format_minutes(r["billable"]),
+                nb=format_minutes(r["not_billable"]) if r["not_billable"] else "") for r in rows]
+    _emit(out, [("key", args.by.upper()), ("time", "TIME"), ("billable_time", "BILLABLE"), ("nb", "NOT BILLABLE"),
+                ("entries", "ENTRIES")], False)
+    if rows:
+        print(f"total:       {format_minutes(sum(r['minutes'] for r in rows))}  ({start} to {end})")
+    return 0
+
+
+def _unbilled_report(h: api_mod.Hidma, args) -> int:
+    client_ids = [match_one(h.clients(), args.client, "client")["id"]] if args.client else None
+    start = args.start or api_mod.REPORT_EPOCH
+    end = args.end or date.today()
+    data = h.raw_report("unbilled", start, end, client_ids=client_ids)
+    rows = []
+    for r in data["rows"]:
+        project = r.get("project") if isinstance(r.get("project"), dict) else {}
+        rows.append({"client": _name_of(project.get("client")), "project": project.get("name", ""),
+                     "job": _name_of(r.get("job")), "minutes": int(r.get("minutes") or 0), "cost": r.get("cost"),
+                     "row_ids": r.get("rowIds") or []})
+    if args.json:
+        _emit_json({"from": str(start), "to": str(end), "rows": rows, "totals": data["totals"]})
+        return 0
+    if args.csv:
+        report_mod.write_csv(rows, ["client", "project", "job", "minutes", "cost"])
+        return 0
+    out = [dict(r, time=format_minutes(r["minutes"]), amount=report_mod.money(r["cost"])) for r in rows]
+    _emit(out, [("client", "CLIENT"), ("project", "PROJECT"), ("job", "JOB"), ("time", "UNBILLED"), ("amount", "COST")], False)
+    totals = data["totals"]
+    if rows:
+        print(f"total:       {format_minutes(int(totals.get('totalMinutes') or 0))}  cost {report_mod.money(totals.get('totalCost'))}"
+              f"  ({start} to {end})")
     return 0
 
 
@@ -210,8 +298,7 @@ def cmd_edit(args) -> int:
     if args.json:
         _emit_json(_public(result))
         return 0
-    label = " / ".join(x for x in (result["client"], result["project"], result["job"]) if x)
-    print(f"updated {result['id']}: {format_minutes(result['minutes'])} on {result['date']} for {label}"
+    print(f"updated {result['id']}: {format_minutes(result['minutes'])} on {result['date']} for {_label(result)}"
           + (f", not billable {format_minutes(result['not_billable'])}" if result["not_billable"] else ""))
     return 0
 
@@ -219,9 +306,8 @@ def cmd_edit(args) -> int:
 def cmd_delete(args) -> int:
     h = api_mod.Hidma()
     entry = _locate(h, args.id, args.date)
-    label = " / ".join(x for x in (entry["client"], entry["project"], entry["job"]) if x)
     if not args.yes:
-        print(f"would delete {format_minutes(entry['minutes'])} on {entry['date']} for {label} ({entry['id']}); "
+        print(f"would delete {format_minutes(entry['minutes'])} on {entry['date']} for {_label(entry)} ({entry['id']}); "
               "re-run with --yes", file=sys.stderr)
         return EXIT_USAGE
     result = h.delete_cell(entry)
@@ -231,25 +317,275 @@ def cmd_delete(args) -> int:
     if not result["gone"]:
         print(f"hidma: {entry['id']} is still present after the delete call", file=sys.stderr)
         return EXIT_API
-    print(f"deleted {format_minutes(entry['minutes'])} on {entry['date']} for {label}"
+    print(f"deleted {format_minutes(entry['minutes'])} on {entry['date']} for {_label(entry)}"
           + (" (its row had no other entries, removed too)" if result["row_deleted"] else ""))
     return 0
 
 
-def cmd_timer(args) -> int:
+# -- timers ---------------------------------------------------------------
+
+def _timer_rows(h: api_mod.Hidma, data: dict) -> list[dict]:
+    ts = data.get("timesheet") or {}
+    labels = {e["id"]: _label(e) for e in api_mod.flatten(h.timesheet(ts["id"]))} if ts.get("id") else {}
+    rows = []
+    for t in data.get("timers") or []:
+        started = api_mod.timer_started_at(t)
+        rows.append({"id": t.get("id"), "state": api_mod.timer_state(t).lower() or "-",
+                     "elapsed": format_minutes(api_mod.accumulated_seconds(t.get("timerEvents") or []) // 60),
+                     "since": started.strftime("%Y-%m-%d %H:%M") if started else "",
+                     "target": labels.get(api_mod.timer_cell_id(t), ""), "comments": t.get("comments") or ""})
+    return rows
+
+
+TIMER_COLUMNS = [("state", "STATE"), ("elapsed", "ELAPSED"), ("since", "STARTED"), ("target", "ON"), ("comments", "COMMENT"), ("id", "ID")]
+
+
+def cmd_timer_list(args) -> int:
     h = api_mod.Hidma()
     data = h.timers_for_week(args.date)
-    timers = data.get("timers") or []
     if args.json:
-        _emit_json(timers)
+        _emit_json(data.get("timers") or [])
         return 0
+    _emit(_timer_rows(h, data), TIMER_COLUMNS, False)
+    return 0
+
+
+def cmd_timer_start(args) -> int:
+    h = api_mod.Hidma()
+    project, job = _resolve_target(h, args.project, args.job)
+    result = h.start_timer(project=project, job=job, comments=args.description, billable=args.billable)
+    if args.json:
+        _emit_json(result)
+        return 0
+    target = " / ".join(x for x in (_name_of((project or {}).get("client")), (project or {}).get("name", ""), job.get("name", "")) if x)
+    print(f"timer started on {target}" + (f" (today's entry already holds {format_minutes(result['base_minutes'])})"
+                                            if result["base_minutes"] else ""))
+    print(f"id: {result['timer']['id']}")
+    return 0
+
+
+def _running(h: api_mod.Hidma) -> dict:
+    timer = h.active_timer()
+    if timer is None:
+        raise MatchError("no running or paused timer this week")
+    return timer
+
+
+def cmd_timer_status(args) -> int:
+    h = api_mod.Hidma()
+    timer = h.active_timer()
+    if args.json:
+        _emit_json(timer)
+        return 0
+    if timer is None:
+        print("no running or paused timer")
+        return 0
+    row = _timer_rows(h, {"timesheet": {"id": timer["timesheet_id"]}, "timers": [timer]})[0]
+    print(f"{row['state']} {row['elapsed']} on {row['target'] or '?'} since {row['since']}"
+          + (f': "{row["comments"]}"' if row["comments"] else ""))
+    return 0
+
+
+def cmd_timer_pause(args) -> int:
+    h = api_mod.Hidma()
+    timer = _running(h)
+    if api_mod.timer_state(timer) == api_mod.TIMER_PAUSE:
+        raise MatchError("the timer is already paused")
+    h.timer_event(timer, api_mod.TIMER_PAUSE)
+    print(f"paused after {format_minutes(api_mod.accumulated_seconds(timer.get('timerEvents') or []) // 60)}")
+    return 0
+
+
+def cmd_timer_resume(args) -> int:
+    h = api_mod.Hidma()
+    timer = _running(h)
+    if api_mod.timer_state(timer) != api_mod.TIMER_PAUSE:
+        raise MatchError("the timer is not paused")
+    h.timer_event(timer, api_mod.TIMER_RESUME)
+    print("resumed")
+    return 0
+
+
+def cmd_timer_stop(args) -> int:
+    h = api_mod.Hidma()
+    result = h.stop_timer(_running(h))
+    if args.json:
+        _emit_json(result)
+        return 0
+    ran = result["seconds"]
+    cell = result["cell"]
+    print(f"stopped after {ran // 3600}h{ran % 3600 // 60:02d}m{ran % 60:02d}s")
+    if cell:
+        print(f"{_label(cell)} on {cell['date']}: now {format_minutes(cell['minutes'])} (id {cell['id']})"
+              + (" (written by the CLI, the server left the entry untouched)" if result["cli_wrote_minutes"] else ""))
+    else:
+        print("hidma: the timer's entry could not be read back; check `hidma today`", file=sys.stderr)
+        return EXIT_API
+    return 0
+
+
+def cmd_timer_discard(args) -> int:
+    h = api_mod.Hidma()
+    timer = _running(h)
+    if not args.yes:
+        print(f"would discard the {api_mod.timer_state(timer).lower()} timer {timer['id']} and its tracked time; "
+              "re-run with --yes", file=sys.stderr)
+        return EXIT_USAGE
+    result = h.discard_timer(timer)
+    if args.json:
+        _emit_json(result)
+        return 0
+    if not result["gone"]:
+        print(f"hidma: timer {timer['id']} is still present after the delete call", file=sys.stderr)
+        return EXIT_API
+    print("timer discarded" + (f"; its entry {result['cell_id']} is still there with "
+                               f"{format_minutes(result['cell_minutes'])}" if result["cell_present"] else ""))
+    return 0
+
+
+# -- favourites -----------------------------------------------------------
+
+def _fav_rows(favs: list[dict]) -> list[dict]:
     rows = []
-    for t in timers:
-        events = t.get("timerEvents") or []
-        last = events[-1] if events else {}
-        rows.append({"id": t.get("id"), "cell": t.get("timesheetRowCellId") or (t.get("timesheetRowCell") or {}).get("id"),
-                     "state": last.get("eventType", ""), "since": last.get("startTime", ""), "comments": t.get("comments", "")})
-    _emit(rows, [("id", "ID"), ("cell", "CELL"), ("state", "LAST EVENT"), ("since", "AT"), ("comments", "COMMENT")], False)
+    for f in favs:
+        project = f.get("project") if isinstance(f.get("project"), dict) else {}
+        rows.append({"id": f.get("id"), "client": _name_of(project.get("client")), "project": project.get("name", ""),
+                     "job": _name_of(f.get("job"))})
+    return rows
+
+
+def cmd_fav_list(args) -> int:
+    favs = api_mod.Hidma().favourites()
+    if args.json:
+        _emit_json(favs)
+        return 0
+    _emit(_fav_rows(favs), [("client", "CLIENT"), ("project", "PROJECT"), ("job", "JOB"), ("id", "ID")], False)
+    return 0
+
+
+def cmd_fav_add(args) -> int:
+    h = api_mod.Hidma()
+    project, job = _resolve_target(h, args.project, args.job)
+    fav = h.add_favourite(project["id"] if project else None, job["id"])
+    if args.json:
+        _emit_json(fav)
+        return 0
+    row = _fav_rows([fav])[0]
+    print(f"favourite added: {' / '.join(x for x in (row['client'], row['project'], row['job']) if x)} (id {row['id']})")
+    return 0
+
+
+def cmd_fav_remove(args) -> int:
+    h = api_mod.Hidma()
+    fav = next((f for f in h.favourites() if f.get("id") == args.id), None)
+    if fav is None:
+        raise MatchError(f"no favourite with id {args.id}")
+    if not h.delete_favourite(args.id):
+        print(f"hidma: favourite {args.id} is still present after the delete call", file=sys.stderr)
+        return EXIT_API
+    print("favourite removed")
+    return 0
+
+
+# -- clients, projects, jobs ----------------------------------------------
+
+def cmd_client_add(args) -> int:
+    client = api_mod.Hidma().add_client(args.name, type_shortcode=args.type, vat=args.vat or "")
+    if args.json:
+        _emit_json(client)
+        return 0
+    print(f"client created: {client.get('name')} (id {client.get('id')})")
+    return 0
+
+
+def cmd_client_edit(args) -> int:
+    if args.name is None and args.vat is None and args.type is None and args.state is None:
+        raise MatchError("nothing to change: give --name, --vat, --type or --state")
+    h = api_mod.Hidma()
+    client = match_one(h.clients(), args.client, "client")
+    result = h.update_client(client["id"], name=args.name, vat=args.vat, type_shortcode=args.type, state_shortcode=args.state)
+    if args.json:
+        _emit_json(result)
+        return 0
+    print(f"client updated: {result.get('name')} (id {result.get('id')})")
+    return 0
+
+
+def _only_team(h: api_mod.Hidma, query: str | None) -> str:
+    teams = h.teams()
+    if query:
+        return match_one(teams, query, "team")["id"]
+    if len(teams) != 1:
+        raise MatchError("pick a team with --team; teams: " + (", ".join(t.get("name", "") for t in teams) or "none"))
+    return teams[0]["id"]
+
+
+def cmd_project_add(args) -> int:
+    h = api_mod.Hidma()
+    jobs = h.jobs()
+    job_ids = [match_one(jobs, q, "job")["id"] for q in args.jobs.split(",") if q.strip()]
+    client_id = match_one(h.clients(), args.client, "client")["id"] if args.client else None
+    project = h.add_project(args.name, client_id=client_id, job_ids=job_ids, team_id=_only_team(h, args.team),
+                            type_shortcode="i" if args.internal else "b", description=args.description or "")
+    if args.json:
+        _emit_json(project)
+        return 0
+    print(f"project created: {project.get('name')} (id {project.get('id')})")
+    return 0
+
+
+def cmd_project_edit(args) -> int:
+    if args.name is None and args.description is None and args.state is None and not args.add_job and not args.remove_job:
+        raise MatchError("nothing to change: give --name, --description, --state, --add-job or --remove-job")
+    h = api_mod.Hidma()
+    project = match_one(h.projects(), args.project, "project", names=("name", "code"))
+    jobs = h.jobs()
+    add = [match_one(jobs, q, "job")["id"] for q in args.add_job]
+    remove = [match_one(jobs, q, "job")["id"] for q in args.remove_job]
+    result = h.update_project(project["id"], name=args.name, add_job_ids=add, remove_job_ids=remove,
+                              state_shortcode=args.state, description=args.description)
+    if args.json:
+        _emit_json(result)
+        return 0
+    print(f"project updated: {result.get('name')} (id {result.get('id')}), jobs: "
+          + ", ".join(_name_of(j) for j in result.get("jobs") or []))
+    return 0
+
+
+def cmd_job_add(args) -> int:
+    job = api_mod.Hidma().add_job(args.name, type_shortcode=args.type, description=args.description or "")
+    if args.json:
+        _emit_json(job)
+        return 0
+    print(f"job created: {job.get('name')} (id {job.get('id')})")
+    return 0
+
+
+def cmd_job_edit(args) -> int:
+    if args.name is None and args.description is None and args.type is None and args.active is None:
+        raise MatchError("nothing to change: give --name, --description, --type, --active or --inactive")
+    h = api_mod.Hidma()
+    job = match_one(h.jobs(), args.job, "job")
+    result = h.update_job(job["id"], name=args.name, type_shortcode=args.type, active=args.active, description=args.description)
+    if args.json:
+        _emit_json(result)
+        return 0
+    print(f"job updated: {result.get('name')} (id {result.get('id')}), active: {result.get('active')}")
+    return 0
+
+
+def cmd_teams(args) -> int:
+    rows = api_mod.Hidma().teams()
+    _emit(rows, [("id", "ID"), ("name", "NAME")], args.json)
+    return 0
+
+
+def cmd_users(args) -> int:
+    h = api_mod.Hidma()
+    teams = {t.get("id"): t.get("name", "") for t in h.teams()}
+    rows = [{"id": u.get("id"), "name": " ".join(x for x in (u.get("name"), u.get("surname")) if x),
+             "team": teams.get(u.get("teamId"), u.get("teamId") or ""), "active": u.get("active", "")} for u in h.users()]
+    _emit(rows, [("id", "ID"), ("name", "NAME"), ("team", "TEAM"), ("active", "ACTIVE")], args.json)
     return 0
 
 
@@ -258,6 +594,16 @@ def cmd_timer(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="emit JSON instead of a table")
+
+    ranged = argparse.ArgumentParser(add_help=False)
+    ranged.add_argument("--week", type=_parse_date, help="the week containing this date")
+    ranged.add_argument("--month", type=_parse_month, help="YYYY-MM")
+    ranged.add_argument("--from", dest="start", type=_parse_date, help="YYYY-MM-DD")
+    ranged.add_argument("--to", dest="end", type=_parse_date, help="YYYY-MM-DD")
+
+    target = argparse.ArgumentParser(add_help=False)
+    target.add_argument("--project", help="project name substring, code or id")
+    target.add_argument("--job", help="job name or id (defaults to the only business job when --project is given)")
 
     parser = argparse.ArgumentParser(prog="hidma", description="Log and read time in hidma from the terminal.")
     parser.add_argument("--version", action="version", version=f"hidma {__version__}")
@@ -283,22 +629,34 @@ def build_parser() -> argparse.ArgumentParser:
     j.add_argument("--filter", help="server-side name filter")
     j.set_defaults(func=cmd_jobs)
 
-    lo = sub.add_parser("log", parents=[common], help="log time: hidma log 1h30 \"what you did\" --project X")
+    lo = sub.add_parser("log", parents=[common, target], help="log time: hidma log 1h30 \"what you did\" --project X")
     lo.add_argument("duration", help="1h30, 90m, 1.5h or 1:30")
     lo.add_argument("description", help="the entry comment")
-    lo.add_argument("--project", help="project name substring, code or id")
-    lo.add_argument("--job", help="job name or id (defaults to the only business job when --project is given)")
     lo.add_argument("--date", type=_parse_date, default=date.today(), help="YYYY-MM-DD, today or yesterday (default today)")
     lo.add_argument("--billable", dest="billable", action="store_true", default=True)
     lo.add_argument("--no-billable", dest="billable", action="store_false", help="mark the whole entry as not billable")
     lo.set_defaults(func=cmd_log)
 
-    en = sub.add_parser("entries", parents=[common], help="list entries with totals per day and project (default: this week)")
-    en.add_argument("--week", type=_parse_date, help="the week containing this date")
-    en.add_argument("--from", dest="start", type=_parse_date, help="YYYY-MM-DD")
-    en.add_argument("--to", dest="end", type=_parse_date, help="YYYY-MM-DD")
+    en = sub.add_parser("entries", parents=[common, ranged], help="list entries with totals per day and project (default: this week)")
     en.add_argument("--project", help="only entries whose project or client contains this")
     en.set_defaults(func=cmd_entries)
+
+    sub.add_parser("today", parents=[common], help="today's entries").set_defaults(func=cmd_today)
+
+    la = sub.add_parser("last", parents=[common], help="the most recent entries")
+    la.add_argument("count", nargs="?", type=int, default=10, help="how many (default 10)")
+    la.set_defaults(func=cmd_last)
+
+    wk = sub.add_parser("week", parents=[common], help="the week as a grid: one row per project and job, a column per day")
+    wk.add_argument("--date", type=_parse_date, default=date.today(), help="the week containing this date")
+    wk.set_defaults(func=cmd_week)
+
+    rp = sub.add_parser("report", parents=[common, ranged], help="time per client, project, job, day or week; or unbilled time")
+    rp.add_argument("--by", choices=report_mod.GROUPS, default="project")
+    rp.add_argument("--unbilled", action="store_true", help="hidma's unbilled report instead: time and cost not yet billed")
+    rp.add_argument("--client", help="unbilled: only this client")
+    rp.add_argument("--csv", action="store_true", help="CSV instead of a table")
+    rp.set_defaults(func=cmd_report)
 
     ed = sub.add_parser("edit", parents=[common], help="change an entry's duration, comment or billable flag")
     ed.add_argument("id", help="the entry id (ID column of `entries`)")
@@ -315,9 +673,88 @@ def build_parser() -> argparse.ArgumentParser:
     de.add_argument("--date", type=_parse_date, help="the week to look in first")
     de.set_defaults(func=cmd_delete)
 
-    ti = sub.add_parser("timers", parents=[common], help="list the week's stopwatch timers (read-only)")
-    ti.add_argument("--date", type=_parse_date, default=date.today(), help="the week containing this date")
-    ti.set_defaults(func=cmd_timer)
+    ti = sub.add_parser("timer", help="stopwatch timers: start, status, pause, resume, stop, discard, list")
+    tsub = ti.add_subparsers(dest="action", required=True)
+    ts = tsub.add_parser("start", parents=[common, target], help="start a timer on a project (one at a time)")
+    ts.add_argument("description", nargs="?", default="", help="the timer comment")
+    ts.add_argument("--billable", dest="billable", action="store_true", default=True)
+    ts.add_argument("--no-billable", dest="billable", action="store_false")
+    ts.set_defaults(func=cmd_timer_start)
+    tsub.add_parser("status", parents=[common], help="the running or paused timer").set_defaults(func=cmd_timer_status)
+    tsub.add_parser("pause", parents=[common]).set_defaults(func=cmd_timer_pause)
+    tsub.add_parser("resume", parents=[common]).set_defaults(func=cmd_timer_resume)
+    tsub.add_parser("stop", parents=[common], help="stop and write the minutes into today's entry").set_defaults(func=cmd_timer_stop)
+    td = tsub.add_parser("discard", parents=[common], help="drop the timer and its tracked time (needs --yes)")
+    td.add_argument("--yes", action="store_true")
+    td.set_defaults(func=cmd_timer_discard)
+    tl = tsub.add_parser("list", parents=[common], help="the week's timers")
+    tl.add_argument("--date", type=_parse_date, default=date.today(), help="the week containing this date")
+    tl.set_defaults(func=cmd_timer_list)
+
+    tis = sub.add_parser("timers", parents=[common], help="the week's timers (same as `timer list`)")
+    tis.add_argument("--date", type=_parse_date, default=date.today(), help="the week containing this date")
+    tis.set_defaults(func=cmd_timer_list)
+
+    fv = sub.add_parser("fav", help="favourite project/job pairs for the timer widget")
+    fsub = fv.add_subparsers(dest="action", required=True)
+    fsub.add_parser("list", parents=[common]).set_defaults(func=cmd_fav_list)
+    fsub.add_parser("add", parents=[common, target]).set_defaults(func=cmd_fav_add)
+    fr = fsub.add_parser("remove", parents=[common])
+    fr.add_argument("id", help="the favourite id (ID column of `fav list`)")
+    fr.set_defaults(func=cmd_fav_remove)
+
+    cl = sub.add_parser("client", help="add or edit a client")
+    csub = cl.add_subparsers(dest="action", required=True)
+    ca = csub.add_parser("add", parents=[common])
+    ca.add_argument("name")
+    ca.add_argument("--type", choices=("c", "s", "u"), default="c", help="company, self-employed or unknown (default c)")
+    ca.add_argument("--vat", help="VAT number")
+    ca.set_defaults(func=cmd_client_add)
+    ce = csub.add_parser("edit", parents=[common])
+    ce.add_argument("client", help="client name substring or id")
+    ce.add_argument("--name")
+    ce.add_argument("--vat")
+    ce.add_argument("--type", choices=("c", "s", "u"))
+    ce.add_argument("--state", choices=("a", "i", "c"), help="active, inactive or closed")
+    ce.set_defaults(func=cmd_client_edit)
+
+    pr = sub.add_parser("project", help="add or edit a project")
+    psub = pr.add_subparsers(dest="action", required=True)
+    pa = psub.add_parser("add", parents=[common])
+    pa.add_argument("name")
+    pa.add_argument("--client", help="client name substring or id (business projects)")
+    pa.add_argument("--jobs", required=True, help="comma-separated job names or ids")
+    pa.add_argument("--team", help="team name or id (default: the only team)")
+    pa.add_argument("--internal", action="store_true", help="an internal project (no client)")
+    pa.add_argument("--description")
+    pa.set_defaults(func=cmd_project_add)
+    pe = psub.add_parser("edit", parents=[common])
+    pe.add_argument("project", help="project name substring, code or id")
+    pe.add_argument("--name")
+    pe.add_argument("--description")
+    pe.add_argument("--state", choices=("a", "i", "c"), help="active, on hold or closed")
+    pe.add_argument("--add-job", action="append", default=[], metavar="JOB")
+    pe.add_argument("--remove-job", action="append", default=[], metavar="JOB")
+    pe.set_defaults(func=cmd_project_edit)
+
+    jb = sub.add_parser("job", help="add or edit a job")
+    jsub = jb.add_subparsers(dest="action", required=True)
+    ja = jsub.add_parser("add", parents=[common])
+    ja.add_argument("name")
+    ja.add_argument("--type", choices=("b", "i", "p"), default="b", help="business, internal or personal (default b)")
+    ja.add_argument("--description")
+    ja.set_defaults(func=cmd_job_add)
+    je = jsub.add_parser("edit", parents=[common])
+    je.add_argument("job", help="job name or id")
+    je.add_argument("--name")
+    je.add_argument("--description")
+    je.add_argument("--type", choices=("b", "i", "p"))
+    je.add_argument("--active", dest="active", action="store_true", default=None)
+    je.add_argument("--inactive", dest="active", action="store_false")
+    je.set_defaults(func=cmd_job_edit)
+
+    sub.add_parser("teams", parents=[common], help="list teams").set_defaults(func=cmd_teams)
+    sub.add_parser("users", parents=[common], help="list users").set_defaults(func=cmd_users)
 
     return parser
 
